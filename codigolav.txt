@@ -1,0 +1,544 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# Sistema de tickets para lavandería con interfaz Tkinter
+# - Genera QR único por ticket (GUID)
+# - No pide Cliente ID (se crea cliente automáticamente)
+# - Campo "Identificación" renombrado a "Teléfono/Contacto"
+# - Auto-rellena fecha y hora
+#
+# Requisitos:
+# pip install qrcode[pil] pyodbc opencv-python pyzbar pillow
+#
+# CONFIGURA la cadena de conexión CONN_STR antes de ejecutar.
+
+import os
+import uuid
+import qrcode
+import pyodbc
+import cv2
+from pyzbar import pyzbar
+import threading
+import time
+from datetime import datetime
+from tkinter import (
+    Tk, Frame, Label, Entry, Button, StringVar, LEFT, RIGHT, TOP, BOTTOM,
+    BOTH, X, Y, W, E, N, S, messagebox, Toplevel, ttk, BooleanVar, Checkbutton
+)
+from PIL import Image, ImageTk
+
+# ---------------------------
+# CONFIGURACIÓN (editar)
+# ---------------------------
+CONN_STR = (
+    "DRIVER={ODBC Driver 17 for SQL Server};"
+    "SERVER=GHOST\\SQLEXPRESS;"
+    "DATABASE=BDLavanderia;"
+    "Trusted_Connection=yes;"
+)
+
+conn = pyodbc.connect(CONN_STR)
+cur = conn.cursor()
+cur.execute("SELECT TOP 1 1")
+print(cur.fetchone())
+conn.close()
+
+
+# ---------------------------
+# UTILIDADES DB
+# ---------------------------
+def get_connection():
+    return pyodbc.connect(CONN_STR, autocommit=False)
+
+def fetch_services():
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT ServicioID, Nombre, Costo FROM Servicios ORDER BY Nombre")
+        return cur.fetchall()
+    finally:
+        conn.close()
+
+def create_client(nombre, telefono):
+    """Inserta cliente y retorna el ClienteID (IDENTITY)"""
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO Clientes (Nombre, Identificacion) VALUES (?, ?)", nombre, telefono)
+        cur.execute("SELECT SCOPE_IDENTITY()")
+        new_id = cur.fetchone()[0]
+        conn.commit()
+        return int(new_id)
+    finally:
+        conn.close()
+
+def create_service(nombre, costo):
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO Servicios (Nombre, Costo) VALUES (?, ?)", nombre, float(costo))
+        # confirmar antes de intentar leer identity
+        conn.commit()
+        # ahora obtener el identity en una nueva consulta segura
+        cur.execute("SELECT TOP 1 ServicioID FROM Servicios WHERE Nombre = ? ORDER BY ServicioID DESC", nombre)
+        row = cur.fetchone()
+        if not row or row[0] is None:
+            raise RuntimeError("No se pudo obtener el ID del servicio insertado.")
+        return int(row[0])
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+
+def crear_ticket_db(ticket_guid, cliente_id, servicio_id, fecha_hora, pagado):
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO Tickets (TicketGUID, ClienteID, ServicioID, FechaCreacion, Pagado) VALUES (CONVERT(uniqueidentifier, ?), ?, ?, ?, ?)",
+            ticket_guid, cliente_id, servicio_id, fecha_hora, 1 if pagado else 0
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+def buscar_ticket_db(ticket_guid):
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+              t.TicketGUID,
+              c.Nombre,
+              c.Identificacion,
+              s.Nombre,
+              s.Costo,
+              t.Pagado,
+              t.FechaCreacion
+            FROM Tickets t
+            JOIN Clientes c ON t.ClienteID = c.ClienteID
+            JOIN Servicios s ON t.ServicioID = s.ServicioID
+            WHERE t.TicketGUID = CONVERT(uniqueidentifier, ?)
+            """,
+            ticket_guid
+        )
+        return cur.fetchone()
+    finally:
+        conn.close()
+
+# ---------------------------
+# GENERAR QR Y CREAR TICKET
+# ---------------------------
+def generar_qr_para_ticket(cliente_id, servicio_id, fecha_hora, pagado):
+    ticket_guid = str(uuid.uuid4())
+    qr = qrcode.QRCode(version=1, box_size=8, border=4)
+    qr.add_data(ticket_guid)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    filename = os.path.join(QR_FOLDER, f"{ticket_guid}.png")
+    img.save(filename)
+    crear_ticket_db(ticket_guid, cliente_id, servicio_id, fecha_hora, pagado)
+    return ticket_guid, filename
+
+# ---------------------------
+# INTERFAZ PRINCIPAL (Tkinter)
+# ---------------------------
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Sistema de Tickets - Lavandería (Registro rápido)")
+        self.root.geometry("980x560")
+        self.root.resizable(False, False)
+
+        # Variables (auto-rellenable)
+        self.nombre_var = StringVar()
+        self.telefono_var = StringVar()   # antes "identificacion"
+        self.servicio_var = StringVar()
+        self.servicio_id_var = StringVar()
+        self.servicio_nombre_var = StringVar()
+        self.costo_var = StringVar()
+        self.fecha_var = StringVar()
+        self.hora_var = StringVar()
+        self.pagado_var = BooleanVar(value=False)
+
+        self.status_var = StringVar(value="Listo")
+        self.info_text_var = StringVar(value="Información del ticket aparecerá aquí.")
+        self.qr_image_tk = None
+
+        # Cámara
+        self.cap = None
+        self.scanning = False
+        self.capture_thread = None
+
+        # Cargar servicios
+        self.services = []
+        self._load_services()
+
+        # Layout
+        self._build_ui()
+        self._autofill_datetime()
+
+    def _load_services(self):
+        try:
+            rows = fetch_services()
+            self.services = [(r[0], r[1], float(r[2])) for r in rows]
+        except Exception:
+            self.services = []
+
+    def _build_ui(self):
+        left = Frame(self.root, width=480, height=560, padx=10, pady=10)
+        left.pack(side=LEFT, fill=Y)
+        right = Frame(self.root, width=500, height=560, padx=10, pady=10)
+        right.pack(side=RIGHT, fill=Y)
+
+        # --- Panel Crear Ticket (rápido) ---
+        Label(left, text="Registro rápido de venta", font=("Arial", 16, "bold")).pack(anchor=W, pady=(0,8))
+
+        frm = Frame(left)
+        frm.pack(fill=X, pady=(0,6))
+
+        # Nombre cliente
+        Label(frm, text="Nombre cliente:", anchor=W).grid(row=0, column=0, sticky=W, pady=4)
+        Entry(frm, textvariable=self.nombre_var, width=36).grid(row=0, column=1, columnspan=2, sticky=W, pady=4)
+
+        # Teléfono/Contacto (antes Identificación)
+        Label(frm, text="Teléfono/Contacto:", anchor=W).grid(row=1, column=0, sticky=W, pady=4)
+        Entry(frm, textvariable=self.telefono_var, width=36).grid(row=1, column=1, columnspan=2, sticky=W, pady=4)
+
+        # Servicio: dropdown rápido + mostrar costo
+        Label(frm, text="Servicio:", anchor=W).grid(row=2, column=0, sticky=W, pady=8)
+        service_names = [f"{s[0]} - {s[1]}" for s in self.services]
+        service_names.insert(0, "Nuevo servicio...")
+        self.cmb_service = ttk.Combobox(frm, values=service_names, state="readonly", width=30)
+        self.cmb_service.current(0)
+        self.cmb_service.grid(row=2, column=1, sticky=W)
+        self.cmb_service.bind("<<ComboboxSelected>>", self.on_service_selected)
+
+        btn_new_service = Button(frm, text="Crear servicio rápido", command=self.on_create_service_quick, width=18)
+        btn_new_service.grid(row=2, column=2, padx=6)
+
+        Label(frm, text="Costo:", anchor=W).grid(row=3, column=0, sticky=W, pady=4)
+        Entry(frm, textvariable=self.costo_var, width=18).grid(row=3, column=1, sticky=W, pady=4)
+
+        # Fecha y hora auto-rellenable (editable)
+        Label(frm, text="Fecha (YYYY-MM-DD):", anchor=W).grid(row=4, column=0, sticky=W, pady=8)
+        Entry(frm, textvariable=self.fecha_var, width=18).grid(row=4, column=1, sticky=W)
+        Label(frm, text="Hora (HH:MM):", anchor=W).grid(row=4, column=2, sticky=W)
+        Entry(frm, textvariable=self.hora_var, width=10).grid(row=4, column=3, sticky=W)
+
+        # Pagado
+        chk = Checkbutton(frm, text="Pagado", variable=self.pagado_var)
+        chk.grid(row=5, column=1, sticky=W, pady=(8,4))
+
+        # Botones rápidos para acelerar registro
+        btn_frame = Frame(left)
+        btn_frame.pack(fill=X, pady=(8,6))
+        Button(btn_frame, text="Generar ticket (rápido)", command=self.on_generar_ticket, width=22).pack(side=LEFT, padx=6)
+        Button(btn_frame, text="Limpiar campos", command=self.on_clear_fields, width=16).pack(side=LEFT, padx=6)
+
+        # QR preview y mensajes
+        Label(left, text="QR generado:", font=("Arial", 10, "bold")).pack(anchor=W, pady=(8,4))
+        self.lbl_qr_preview = Label(left, text="(sin imagen)", width=40, height=12, relief="sunken")
+        self.lbl_qr_preview.pack()
+
+        Label(left, text="Mensajes:", font=("Arial", 10, "bold")).pack(anchor=W, pady=(8,4))
+        self.lbl_messages = Label(left, text="", anchor=W, justify=LEFT, fg="blue")
+        self.lbl_messages.pack(fill=X)
+
+        # --- Panel Escáner y confirmación ---
+        Label(right, text="Escáner y Confirmación", font=("Arial", 16, "bold")).pack(anchor=W, pady=(0,8))
+
+        btn_frame2 = Frame(right)
+        btn_frame2.pack(fill=X, pady=(0,8))
+        self.btn_start = Button(btn_frame2, text="Iniciar Cámara", command=self.start_scanner, width=16)
+        self.btn_start.pack(side=LEFT, padx=4)
+        self.btn_stop = Button(btn_frame2, text="Detener Cámara", command=self.stop_scanner, state="disabled", width=16)
+        self.btn_stop.pack(side=LEFT, padx=4)
+        self.btn_preview = Button(btn_frame2, text="Abrir Preview", command=self.open_preview_window, width=16)
+        self.btn_preview.pack(side=LEFT, padx=4)
+
+        Label(right, text="Estado:", anchor=W).pack(anchor=W)
+        Label(right, textvariable=self.status_var, relief="sunken", width=60, anchor=W).pack(pady=(4,8))
+
+        Label(right, text="Datos del ticket:", anchor=W).pack(anchor=W)
+        self.lbl_info = Label(right, textvariable=self.info_text_var, justify=LEFT, anchor=W, relief="sunken", width=60, height=12)
+        self.lbl_info.pack(pady=(4,8))
+
+        # Footer
+        footer = Frame(self.root)
+        footer.pack(side=BOTTOM, fill=X, padx=10, pady=6)
+        Label(footer, text="Registro rápido: ingresa nombre y teléfono para crear cliente automáticamente.").pack(side=LEFT)
+
+    # ---------------------------
+    # AUTOFILL FECHA/HORA
+    # ---------------------------
+    def _autofill_datetime(self):
+        now = datetime.now()
+        self.fecha_var.set(now.strftime("%Y-%m-%d"))
+        self.hora_var.set(now.strftime("%H:%M"))
+
+    # ---------------------------
+    # SERVICIO SELECCIONADO
+    # ---------------------------
+    def on_service_selected(self, event=None):
+        sel = self.cmb_service.get()
+        if not sel:
+            return
+        if sel.startswith("Nuevo servicio"):
+            self.servicio_id_var.set("")
+            self.servicio_nombre_var.set("")
+            self.costo_var.set("")
+        else:
+            try:
+                sid = int(sel.split(" - ")[0])
+            except Exception:
+                return
+            for s in self.services:
+                if s[0] == sid:
+                    self.servicio_id_var.set(str(s[0]))
+                    self.servicio_nombre_var.set(s[1])
+                    self.costo_var.set(f"{s[2]:.2f}")
+                    break
+
+    def on_create_service_quick(self):
+        win = Toplevel(self.root)
+        win.title("Crear servicio rápido")
+        win.geometry("360x160")
+        Label(win, text="Nombre servicio:").pack(anchor=W, padx=10, pady=(10,2))
+        name_var = StringVar()
+        Entry(win, textvariable=name_var, width=40).pack(padx=10)
+        Label(win, text="Costo:").pack(anchor=W, padx=10, pady=(8,2))
+        cost_var = StringVar()
+        Entry(win, textvariable=cost_var, width=20).pack(padx=10)
+
+        def crear():
+            name = name_var.get().strip()
+            cost = cost_var.get().strip()
+            if not name or not cost:
+                messagebox.showwarning("Datos incompletos", "Ingresa nombre y costo.")
+                return
+            try: 
+                cost_val=float(cost)
+            except ValueError:
+                messagebox.showerror("Costo invalid", "El costo debe ser un numero (Ej. 45.00).")
+                return
+            try:
+                sid = create_service(name, float(cost))
+                self._load_services()
+                service_names = [f"{s[0]} - {s[1]}" for s in self.services]
+                service_names.insert(0, "Nuevo servicio...")
+                self.cmb_service.config(values=service_names)
+                idx = service_names.index(f"{sid} - {name}")
+                self.cmb_service.current(idx)
+                self.on_service_selected()
+                self.lbl_messages.config(text=f"Servicio creado: {name} (ID {sid})")
+                win.destroy()
+            except Exception as e:
+                messagebox.showerror("Error al crear servicio", str(e))
+
+        Button(win, text="Crear", command=crear).pack(pady=10)
+
+    # ---------------------------
+    # CREAR TICKET (rápido)
+    # ---------------------------
+    def on_generar_ticket(self):
+        nombre = self.nombre_var.get().strip()
+        telefono = self.telefono_var.get().strip()
+        servicio_id_text = self.servicio_id_var.get().strip()
+        servicio_nombre = self.servicio_nombre_var.get().strip()
+        costo_text = self.costo_var.get().strip()
+        fecha_text = self.fecha_var.get().strip()
+        hora_text = self.hora_var.get().strip()
+        pagado = self.pagado_var.get()
+
+        try:
+            fecha_hora = datetime.strptime(f"{fecha_text} {hora_text}", "%Y-%m-%d %H:%M")
+        except Exception:
+            fecha_hora = datetime.now()
+            self.fecha_var.set(fecha_hora.strftime("%Y-%m-%d"))
+            self.hora_var.set(fecha_hora.strftime("%H:%M"))
+
+        # Cliente: siempre se crea automáticamente (requiere nombre mínimo)
+        if not nombre:
+            messagebox.showwarning("Datos cliente", "Ingresa al menos el nombre del cliente.")
+            return
+        try:
+            cliente_id = create_client(nombre, telefono)
+            self.lbl_messages.config(text=f"Cliente creado automáticamente con ID {cliente_id}")
+        except Exception as e:
+            messagebox.showerror("Error al crear cliente", str(e))
+            return
+
+        # Servicio: si no hay servicio seleccionado, pedir crear o seleccionar
+        servicio_id = None
+        if servicio_id_text:
+            try:
+                servicio_id = int(servicio_id_text)
+            except ValueError:
+                messagebox.showerror("Error", "Servicio ID inválido.")
+                return
+        else:
+            if not servicio_nombre:
+                messagebox.showwarning("Servicio", "Selecciona un servicio existente o crea uno rápido.")
+                return
+            if not costo_text:
+                messagebox.showwarning("Servicio", "Ingresa el costo del servicio.")
+                return
+            try:
+                servicio_id = create_service(servicio_nombre, float(costo_text))
+                self._load_services()
+                service_names = [f"{s[0]} - {s[1]}" for s in self.services]
+                service_names.insert(0, "Nuevo servicio...")
+                self.cmb_service.config(values=service_names)
+                self.cmb_service.set(f"{servicio_id} - {servicio_nombre}")
+                self.servicio_id_var.set(str(servicio_id))
+                self.lbl_messages.config(text=f"Servicio creado automáticamente con ID {servicio_id}")
+            except Exception as e:
+                messagebox.showerror("Error al crear servicio", str(e))
+                return
+
+        # Generar ticket y QR
+        try:
+            guid, ruta = generar_qr_para_ticket(str(cliente_id), int(servicio_id), fecha_hora, pagado)
+            self._load_qr_preview(ruta)
+            self.status_var.set("Ticket creado correctamente.")
+            self.info_text_var.set(f"Ticket: {guid}\nCliente ID: {cliente_id}\nServicio ID: {servicio_id}\nFecha: {fecha_hora.strftime('%Y-%m-%d %H:%M')}\nPagado: {'Sí' if pagado else 'No'}")
+            self.lbl_messages.config(text=f"Ticket {guid} generado. Entrega el QR al cliente.")
+            self._autofill_datetime()
+            self.nombre_var.set("")
+            self.telefono_var.set("")
+            self.servicio_nombre_var.set("")
+            self.costo_var.set("")
+            self.servicio_id_var.set("")
+            self.cmb_service.current(0)
+        except Exception as e:
+            messagebox.showerror("Error al crear ticket", str(e))
+            self.status_var.set("Error al crear ticket.")
+
+    def _load_qr_preview(self, path):
+        try:
+            img = Image.open(path)
+            img = img.resize((260, 260))
+            self.qr_image_tk = ImageTk.PhotoImage(img)
+            self.lbl_qr_preview.config(image=self.qr_image_tk, text="")
+        except Exception:
+            self.lbl_qr_preview.config(text="No se pudo cargar la imagen del QR.", image="")
+
+    def on_clear_fields(self):
+        self.nombre_var.set("")
+        self.telefono_var.set("")
+        self.servicio_id_var.set("")
+        self.servicio_nombre_var.set("")
+        self.costo_var.set("")
+        self.cmb_service.current(0)
+        self.pagado_var.set(False)
+        self._autofill_datetime()
+        self.lbl_messages.config(text="Campos limpiados.")
+
+    # ---------------------------
+    # ESCANEO / CÁMARA
+    # ---------------------------
+    def start_scanner(self):
+        if self.scanning:
+            return
+        self.scanning = True
+        self.btn_start.config(state="disabled")
+        self.btn_stop.config(state="normal")
+        self.status_var.set("Abriendo cámara...")
+        self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self.capture_thread.start()
+
+    def stop_scanner(self):
+        if not self.scanning:
+            return
+        self.scanning = False
+        self.btn_start.config(state="normal")
+        self.btn_stop.config(state="disabled")
+        self.status_var.set("Escaneo detenido.")
+
+    def open_preview_window(self):
+        preview = Toplevel(self.root)
+        preview.title("Preview cámara")
+        preview.geometry("640x480")
+        preview.resizable(False, False)
+        Label(preview, text="Presiona 'q' en la ventana de OpenCV para cerrar el preview.").pack()
+        preview.transient(self.root)
+        preview.grab_set()
+
+    def _capture_loop(self):
+        self.cap = cv2.VideoCapture(0)
+        if not self.cap.isOpened():
+            self.status_var.set("No se pudo abrir la cámara.")
+            self.scanning = False
+            self.btn_start.config(state="normal")
+            self.btn_stop.config(state="disabled")
+            return
+
+        self.status_var.set("Escaneando... muestra el QR a la cámara.")
+        last_detected = None
+        last_time = 0
+        try:
+            while self.scanning:
+                ret, frame = self.cap.read()
+                if not ret:
+                    continue
+                codes = pyzbar.decode(frame)
+                if codes:
+                    code = codes[0]
+                    data = code.data.decode("utf-8")
+                    now = time.time()
+                    if data == last_detected and (now - last_time) < 2.0:
+                        pass
+                    else:
+                        last_detected = data
+                        last_time = now
+                        try:
+                            row = buscar_ticket_db(data)
+                        except Exception as e:
+                            self.status_var.set(f"Error DB: {e}")
+                            time.sleep(1.0)
+                            continue
+
+                        if row:
+                            guid, nombre, telefono, servicio, costo, pagado, fecha_creacion = row
+                            texto = (
+                                f"Ticket: {guid}\n"
+                                f"Cliente: {nombre}\n"
+                                f"Teléfono/Contacto: {telefono}\n"
+                                f"Servicio: {servicio}\n"
+                                f"Costo: ${float(costo):.2f}\n"
+                                f"Pagado: {'Sí' if pagado else 'No'}\n"
+                                f"Fecha creación: {fecha_creacion}"
+                            )
+                            self.info_text_var.set(texto)
+                            self.status_var.set("Ticket encontrado. Verifica antes de entregar.")
+                        else:
+                            self.info_text_var.set("Código QR no existe en la base de datos.")
+                            self.status_var.set("QR inválido.")
+                cv2.imshow("Vista cámara (presiona 'q' para cerrar preview)", frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    cv2.destroyWindow("Vista cámara (presiona 'q' para cerrar preview)")
+                time.sleep(0.02)
+        finally:
+            if self.cap:
+                self.cap.release()
+            cv2.destroyAllWindows()
+            self.scanning = False
+            self.btn_start.config(state="normal")
+            self.btn_stop.config(state="disabled")
+            self.status_var.set("Escaneo detenido.")
+
+# ---------------------------
+# EJECUCIÓN
+# ---------------------------
+def main():
+    root = Tk()
+    app = App(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
