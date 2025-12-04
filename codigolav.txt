@@ -30,10 +30,7 @@ from PIL import Image, ImageTk
 # CONFIGURACIÓN (editar)
 # ---------------------------
 CONN_STR = (
-    "DRIVER={ODBC Driver 17 for SQL Server};"
-    "SERVER=GHOST\\SQLEXPRESS;"
-    "DATABASE=BDLavanderia;"
-    "Trusted_Connection=yes;"
+   
 )
 
 conn = pyodbc.connect(CONN_STR)
